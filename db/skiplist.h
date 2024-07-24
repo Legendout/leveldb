@@ -54,6 +54,8 @@ class SkipList {
   // REQUIRES: nothing that compares equal to key is currently in the list.
   void Insert(const Key& key);
 
+  void InsertConcurrently(const char* key);
+
   // Returns true iff an entry that compares equal to key is in the list.
   bool Contains(const Key& key) const;
 
@@ -125,6 +127,9 @@ class SkipList {
   // Return head_ if list is empty.
   Node* FindLast() const;
 
+  void FindLevelSplice(const char* key, Node* before, Node* after, int level,
+                       Node** out_prev, Node** out_next);
+
   // Immutable after construction
   Comparator const compare_;
   Arena* const arena_;  // Arena used for allocations of nodes
@@ -135,6 +140,7 @@ class SkipList {
   // values are ok.
   std::atomic<int> max_height_;  // Height of the entire list
 
+  std::atomic<int32_t> prev_height_;
   // Read/written only by Insert().
   Random rnd_;
 };
@@ -159,6 +165,11 @@ struct SkipList<Key, Comparator>::Node {
     // Use a 'release store' so that anybody who reads through this
     // pointer observes a fully initialized version of the inserted node.
     next_[n].store(x, std::memory_order_release);
+  }
+
+  bool CASNext(int n, Node* expected, Node* x) {
+    assert(n >= 0);
+    return next_[n].compare_exchange_strong(expected, x);
   }
 
   // No-barrier variants that can be safely used in a few locations.
@@ -362,6 +373,71 @@ void SkipList<Key, Comparator>::Insert(const Key& key) {
     // we publish a pointer to "x" in prev[i].
     x->NoBarrier_SetNext(i, prev[i]->NoBarrier_Next(i));
     prev[i]->SetNext(i, x);
+  }
+}
+
+template <typename Key,class Comparator>
+void SkipList<Key,Comparator>::FindLevelSplice(const char* key, Node* before,
+                                                 Node* after, int level,
+                                                 Node** out_prev,
+                                                 Node** out_next) {
+  while (true) {
+    Node* next = before->Next(level);
+    assert(before == head_ || next == nullptr ||
+           KeyIsAfterNode(next->Key(), before));
+    assert(before == head_ || KeyIsAfterNode(key, before));
+    if (next == after || !KeyIsAfterNode(key, next)) {
+      // found it
+      *out_prev = before;
+      *out_next = next;
+      return;
+    }
+    before = next;
+  }
+}
+
+template <typename Key,class Comparator>
+void SkipList<Key,Comparator>::InsertConcurrently(const char* key) {
+  Node* x = reinterpret_cast<Node*>(const_cast<char*>(key)) - 1;
+  int height = x->UnstashHeight();
+  assert(height >= 1 && height <= kMaxHeight);
+
+  int max_height = max_height_.load(std::memory_order_relaxed);
+  while (height > max_height) {
+    if (max_height_.compare_exchange_strong(max_height, height)) {
+      // successfully updated it
+      max_height = height;
+
+      // we dont have a lock-free algorithm for fixing up prev_, so just
+      // mark it invalid
+      prev_height_.store(0, std::memory_order_relaxed);
+      break;
+    }
+    // else retry, possibly exiting the loop because somebody else
+    // increased it
+  }
+
+  Node* prev[kMaxHeight + 1];
+  Node* next[kMaxHeight + 1];
+  prev[max_height] = head_;
+  next[max_height] = nullptr;
+  for (int i = max_height - 1; i >= 0; --i) {
+    FindLevelSplice(key, prev[i + 1], next[i + 1], i, &prev[i], &next[i]);
+  }
+  for (int i = 0; i < height; ++i) {
+    while (true) {
+      x->NoBarrier_SetNext(i, next[i]);
+      if (prev[i]->CASNext(i, next[i], x)) {
+        // success
+        break;
+      }
+      // CAS failed, we need to recompute prev and next. It is unlikely
+      // to be helpful to try to use a different level as we redo the
+      // search, because it should be unlikely that lots of nodes have
+      // been inserted between prev[i] and next[i]. No point in using
+      // next[i] as the after hint, because we know it is stale.
+      FindLevelSplice(key, prev[i], nullptr, i, &prev[i], &next[i]);
+    }
   }
 }
 
